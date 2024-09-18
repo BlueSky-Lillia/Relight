@@ -18,7 +18,6 @@ from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.util import log_txt_as_img, exists, instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 
-
 class ControlledUnetModel(UNetModel):
     def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
         hs = []
@@ -75,6 +74,7 @@ class ControlNet(nn.Module):
             num_attention_blocks=None,
             disable_middle_self_attn=False,
             use_linear_in_transformer=False,
+            background_caption=None,
     ):
         super().__init__()
         if use_spatial_transformer:
@@ -278,6 +278,8 @@ class ControlNet(nn.Module):
         self.middle_block_out = self.make_zero_conv(ch)
         self._feature_size += ch
 
+        self.background_caption = background_caption
+
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
 
@@ -297,6 +299,7 @@ class ControlNet(nn.Module):
                 guided_hint = None
             else:
                 h = module(h, emb, context)
+
             outs.append(zero_conv(h, emb, context))
 
         h = self.middle_block(h, emb, context)
@@ -305,38 +308,68 @@ class ControlNet(nn.Module):
         return outs
 
 
+
 class ControlLDM(LatentDiffusion):
 
-    def __init__(self, control_stage_config, control_key, only_mid_control, *args, **kwargs):
+    def __init__(self, control_stage_config, control_key, only_mid_control, conditioning_dropout_prob, *args, **kwargs): # add
         super().__init__(*args, **kwargs)
         self.control_model = instantiate_from_config(control_stage_config)
         self.control_key = control_key
         self.only_mid_control = only_mid_control
         self.control_scales = [1.0] * 13
+        self.conditioning_dropout_prob = conditioning_dropout_prob # add
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs)
-        control = batch[self.control_key]
+        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs) # self.first_stage_key = 'jpg', x means ground truth image
+        y, lighting = super().get_input(batch, 'composition', cond_key='caption', *args, **kwargs) # add, y means unhamonized image, namly original images
+        control = batch[self.control_key] # namly batch['hint']
         if bs is not None:
-            control = control[:bs]
+            control = control[:bs] # corresponding to 50% setting null text(trick)
         control = control.to(self.device)
         control = einops.rearrange(control, 'b h w c -> b c h w')
-        control = control.to(memory_format=torch.contiguous_format).float()
-        return x, dict(c_crossattn=[c], c_concat=[control])
+        control = control.to(memory_format=torch.contiguous_format).float() # caption = batch['caption']
+
+              
+        # Sample noise that we'll add to the latents(x)
+        bsz = x.shape[0]
+        generator = torch.Generator(device=x.device).manual_seed(0) # Setting random seed generator
+
+        # Conditioning dropout to support classifier-free guidance during inference. Stolen from https://arxiv.org/abs/2211.09800.
+        if self.conditioning_dropout_prob is not None:
+            random_p = torch.rand(bsz, device=x.device, generator=generator)
+            
+            prompt_mask = random_p < 2 * self.conditioning_dropout_prob
+            prompt_mask = prompt_mask.reshape(bsz, 1, 1)
+
+            image_mask_dtype = y.dtype
+            image_mask = 1 - (
+                (random_p >= self.conditioning_dropout_prob).to(image_mask_dtype)
+                * (random_p < 3 * self.conditioning_dropout_prob).to(image_mask_dtype)
+            )
+            image_mask = image_mask.reshape(bsz, 1, 1, 1)
+            # Final image conditioning.
+            y = image_mask * y
+
+        return [x, y], dict(c_crossattn=[c], c_concat=[control], c_lighting = [lighting])
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
-        assert isinstance(cond, dict)
-        diffusion_model = self.model.diffusion_model
-
+        assert isinstance(cond, dict) # cond is imported from log_image's sample_log
+        # print('This is ControlLDM apply_model:', cond.keys())
+        diffusion_model = self.model.diffusion_model # self.model is DiffusionWrapper which contains the key diffusion_model(the value of it is ControlledUNetModel)
         cond_txt = torch.cat(cond['c_crossattn'], 1)
 
-        if cond['c_concat'] is None:
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
+        cond_lighting = torch.cat(cond['c_lighting'], 1) # (Batch_size, 77, 768), hint : (batch, 3, 512, 512)
+        
+        x_noisy_cat = torch.cat([x_noisy[0], x_noisy[1]], dim=1)
+        
+        if cond['c_concat'] is None: # x_[noisy] = [noisy_latents, original_image_latents * mask]
+            eps = diffusion_model(x=x_noisy_cat, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
-            control = [c * scale for c, scale in zip(control, self.control_scales)]
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
+            control = self.control_model(x=x_noisy[0], hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+            control = [c * scale for c, scale in zip(control, self.control_scales)] # self.control_scales = [1.0] * 13
+
+            eps = diffusion_model(x=x_noisy_cat, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
 
         return eps
 
@@ -354,11 +387,13 @@ class ControlLDM(LatentDiffusion):
 
         log = dict()
         z, c = self.get_input(batch, self.first_stage_key, bs=N)
-        c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
+        z = z[0] # add
+        # print('This is log_images function, condition.keys are:', c.keys())
+        c_cat, c, c_lighting = c["c_concat"][0][:N], c["c_crossattn"][0][:N], c["c_lighting"][0][:N] # add
         N = min(z.shape[0], N)
         n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
-        log["control"] = c_cat * 2.0 - 1.0
+        log["control"] = c_cat * 2.0 - 1.0 # Normalize
         log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
 
         if plot_diffusion_rows:
@@ -379,9 +414,10 @@ class ControlLDM(LatentDiffusion):
             diffusion_grid = make_grid(diffusion_grid, nrow=diffusion_row.shape[0])
             log["diffusion_row"] = diffusion_grid
 
-        if sample:
+        if sample: # False
+            # print('This is controlLDM, sample:', sample)
             # get denoise row
-            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c], 'c_lighting': [c_lighting]}, # add
                                                      batch_size=N, ddim=use_ddim,
                                                      ddim_steps=ddim_steps, eta=ddim_eta)
             x_samples = self.decode_first_stage(samples)
@@ -391,10 +427,12 @@ class ControlLDM(LatentDiffusion):
                 log["denoise_row"] = denoise_grid
 
         if unconditional_guidance_scale > 1.0:
+            # print('This is controlLDM, unconditional_g_scale > 1.0')
             uc_cross = self.get_unconditional_conditioning(N)
             uc_cat = c_cat  # torch.zeros_like(c_cat)
-            uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
-            samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+            uc_c_lighting = c_lighting # add
+            uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross], "c_lighting":[uc_c_lighting]} # add
+            samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c], "c_lighting":[c_lighting]},
                                              batch_size=N, ddim=use_ddim,
                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                              unconditional_guidance_scale=unconditional_guidance_scale,
