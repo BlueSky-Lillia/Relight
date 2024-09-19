@@ -45,19 +45,11 @@ if __name__ =='__main__': # which is important to multiprocess
     model.sd_locked = args.sd_locked
     model.only_mid_control = args.only_mid_control
 
-    # print(model.model.diffusion_model)
-    '''print(model.model.diffusion_model.input_blocks[0]) TimestepEmbedSequential(
-  (0): Conv2d(4, 320, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-) '''
 
     in_channels = 8
-    # if hasattr(model.model.diffusion_model, 'in_channels'): # 'YES'
-    #     print('YES')
     
     model.model.diffusion_model.in_channels = in_channels
-
-    # print(model.model.diffusion_model.input_blocks[0][0]) # Conv2d(4, 320, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-
+    
     with torch.no_grad():
         new_conv_in = nn.Conv2d(
             in_channels, 320, kernel_size=3, stride=1, padding=1
@@ -65,23 +57,6 @@ if __name__ =='__main__': # which is important to multiprocess
         new_conv_in.weight.zero_()
         new_conv_in.weight[:, :4, :, :].copy_(model.model.diffusion_model.input_blocks[0][0].weight)
         model.model.diffusion_model.input_blocks[0][0] = new_conv_in
-
-    # print(model.model.diffusion_model.input_blocks[0][0])
-
-
-    # # 查看模型的顶层模块(仅限于最外层的模块)
-    # for name, module in model.named_children():    
-    #     print(f"Module Name: {name}, Module Type: {type(module)}")
-
-    # # 列出所有子模块
-    # for name, module in model.named_modules():
-    #     print(f"Module Name: {name}, Module Type: {type(module)}")
-
-    # 查看ControlNetModel的forward函数定义
-    # print(ControlNetModel.forward.__doc__)
-
-    # 打印模型的架构
-    # print(controlnet)
 
     # Misc
     dataset = RelightDataset(root = '/home/wangzhen/Data/Raw/ppr10k')
